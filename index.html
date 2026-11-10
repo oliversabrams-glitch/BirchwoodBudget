@@ -601,7 +601,7 @@ function renderAllStatic(){
 const CAT_RULES=[
   {match:['MSK CLINICS','PAYROLL','HEARTCORE','LANESMAN B','ABRAMS V J'],cat:'Income'},
   {match:['MICHELLE','NANNY'],cat:'Nanny'},
-  {match:['INVESTEC BANK','ORM'],cat:'Mortgage'},
+  {match:['INVESTEC BANK','ORM','DIRECT DEBIT CLAIM','INTEREST '],cat:'Mortgage'},
   {match:['OCTOPUS','THAMES WATER'],cat:'Utilities'},
   {match:['L B CAMDEN','COUNCIL TAX'],cat:'Council Tax'},
   {match:['AXA','ADMIRAL','VITALITY','CYCLEPLAN'],cat:'Insurance'},
@@ -648,27 +648,44 @@ async function handlePDF(input){
 function setProgress(pct,text){document.getElementById('progressBar').style.width=pct+'%';document.getElementById('progressText').textContent=text;}
 
 function parseInvestecStatement(text){
-  const txs=[];
+  const MONTHS={JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12'};
   const ci=text.indexOf('Card Transactions for');
   const cleanText=ci>-1?text.slice(0,ci):text;
   const lines=cleanText.split('\n').map(l=>l.trim()).filter(l=>l);
-  const dateRe=/^\d{2}\.\d{2}\.\d{4}$/,amountRe=/^[\d,]+\.\d{2}(CR)?$/;
-  const skipWords=['Investec Bank plc','Prudential','Page ','Posting date','Balance brought','Balance as at','Total','Transaction date','Transaction details','Money out','Money in','Balance'];
-  let i=0;
+  // Accepts "15.05.2026" (old layout) and "15 MAY 2026" (layout from mid-2026)
+  const dotDateRe=/^\d{2}\.\d{2}\.\d{4}$/, wordDateRe=/^(\d{1,2}) ([A-Za-z]{3}) (\d{4})$/;
+  const isDate=l=>dotDateRe.test(l)||(wordDateRe.test(l)&&MONTHS[l.match(wordDateRe)[2].toUpperCase()]);
+  const normDate=l=>{if(dotDateRe.test(l))return l;const m=l.match(wordDateRe);return m[1].padStart(2,'0')+'.'+MONTHS[m[2].toUpperCase()]+'.'+m[3];};
+  const amountRe=/^[\d,]+\.\d{2}(CR|DR)?$/;
+  const toNum=a=>parseFloat(a.replace(/,/g,'').replace(/CR|DR/,''));
+  // Signed balance: DR (overdrawn/borrowed) is negative, CR or plain is positive
+  const signedBal=a=>a.endsWith('DR')?-toNum(a):toNum(a);
+  const skipWords=['Investec Bank plc','Prudential','Page ','Posting date','Balance brought','Balance as at','Total','Transaction date','Transaction details','Money out','Money in','Balance','Important information'];
+  const txs=[];let prevBal=null,i=0;
   while(i<lines.length){
-    const line=lines[i];if(!dateRe.test(line)){i++;continue;}
-    const postDate=line;i++;
-    if(i<lines.length&&dateRe.test(lines[i]))i++;
+    const line=lines[i];if(!isDate(line)){i++;continue;}
+    const postDate=normDate(line);i++;
+    if(i<lines.length&&isDate(lines[i]))i++;
     const descLines=[];
-    while(i<lines.length){const l=lines[i];if(dateRe.test(l))break;if(amountRe.test(l))break;if(skipWords.some(w=>l.includes(w))){i++;continue;}if(l.length>1)descLines.push(l);i++;}
+    while(i<lines.length){const l=lines[i];if(isDate(l))break;if(amountRe.test(l))break;if(skipWords.some(w=>l.includes(w))){i++;continue;}if(l.length>1)descLines.push(l);i++;}
     const amounts=[];
-    while(i<lines.length&&(amountRe.test(lines[i])||lines[i]=='')){if(amountRe.test(lines[i]))amounts.push(lines[i]);i++;}
+    while(i<lines.length&&amountRe.test(lines[i])){amounts.push(lines[i]);i++;}
     const rawDesc=descLines.join(' ').replace(/~~[^\s]*/g,'').replace(/\s+/g,' ').trim();
-    if(!rawDesc||rawDesc.length<3)continue;
-    let moneyOut=null,moneyIn=null;
     const descU=rawDesc.toUpperCase();
-    const isIncoming=descU.match(/FASTER PAYMENT|PAYROLL|INTERNAL TRANSFER FROM|DIRECT DEBIT.*INTEREST RECLAIM/);
-    if(amounts.length>=1){const firstAmt=parseFloat(amounts[0].replace(/,/g,'').replace('CR',''));if(isIncoming||amounts[0].includes('CR'))moneyIn=firstAmt;else moneyOut=firstAmt;}
+    // Opening/closing balance lines: just record the balance
+    if(/BROUGHT FORWARD|CARRIED FORWARD/.test(descU)){if(amounts.length)prevBal=signedBal(amounts[amounts.length-1]);continue;}
+    if(!rawDesc||rawDesc.length<3||!amounts.length)continue;
+    let moneyOut=null,moneyIn=null;const amt=toNum(amounts[0]);
+    if(amounts.length>=2&&prevBal!==null){
+      // Direction from the running balance: balance went up = money in
+      const bal=signedBal(amounts[amounts.length-1]);
+      if(bal>prevBal)moneyIn=amt;else moneyOut=amt;
+      prevBal=bal;
+    }else{
+      const isIncoming=descU.match(/FASTER PAYMENT|PAYROLL|INTERNAL TRANSFER FROM|DIRECT DEBIT.*INTEREST RECLAIM/);
+      if(isIncoming||amounts[0].includes('CR'))moneyIn=amt;else moneyOut=amt;
+      if(amounts.length>=2)prevBal=signedBal(amounts[amounts.length-1]);
+    }
     txs.push({date:postDate,desc:rawDesc,out:moneyOut,in:moneyIn,category:'Other'});
   }
   return txs;
